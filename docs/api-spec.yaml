@@ -1,0 +1,68 @@
+openapi: 3.0.3
+info:
+  title: DriveX API
+  version: 0.1.0
+paths:
+  /auth/register:
+    post:
+      summary: Register a new user
+      responses:
+        "201":
+          description: Created
+  /auth/login:
+    post:
+      summary: Log in and receive a JWT
+      responses:
+        "200":
+          description: OK
+  /folders:
+    post:
+      summary: Create a folder
+      responses:
+        "201":
+          description: Created
+    get:
+      summary: List folder contents
+      responses:
+        "200":
+          description: OK
+  /files/upload-url:
+    post:
+      summary: Request a pre-signed MinIO upload URL
+      responses:
+        "200":
+          description: OK
+  /files/upload-complete:
+    post:
+      summary: Confirm upload and write metadata
+      responses:
+        "200":
+          description: OK
+  /files/{id}/download-url:
+    get:
+      summary: Get a pre-signed download URL
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: OK
+  /search:
+    get:
+      summary: Semantic search (proxied to ML API)
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+  /chat:
+    post:
+      summary: RAG "ask your drive" chat (proxied to ML API)
+      responses:
+        "200":
+          description: OK

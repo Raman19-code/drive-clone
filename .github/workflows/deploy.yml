@@ -1,0 +1,16 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build API image
+        run: docker build -f infra/docker/Dockerfile.api -t drivex-api:${{ github.sha }} .
+      - name: Build ML workers image
+        run: docker build -f infra/docker/Dockerfile.ml-workers -t drivex-ml-workers:${{ github.sha }} .
+      # TODO: push to registry (GHCR/ECR/GCR) and apply infra/k8s manifests

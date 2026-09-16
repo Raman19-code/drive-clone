@@ -1,0 +1,9 @@
+<!-- Rendered partial: list of files/folders in the current folder, loaded via HTMX -->
+<div id="file-list" hx-get="/folders" hx-trigger="refreshFileList from:body" hx-swap="outerHTML">
+  {% for item in items %}
+  <div class="flex items-center justify-between p-2 hover:bg-gray-100 rounded">
+    <span>{{ item.name }}</span>
+    <button hx-get="/share-dialog?resource={{ item.id }}" hx-target="#modal">Share</button>
+  </div>
+  {% endfor %}
+</div>

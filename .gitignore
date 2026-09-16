@@ -1,0 +1,33 @@
+# C++ / CMake
+api/build/
+api/CMakeCache.txt
+api/CMakeFiles/
+*.o
+*.obj
+*.exe
+
+# Python
+ml-workers/__pycache__/
+ml-workers/**/__pycache__/
+ml-workers/.venv/
+*.pyc
+
+# Node / frontend
+frontend/node_modules/
+frontend/static/css/*.built.css
+
+# Env & secrets
+.env
+.env.*
+*.pem
+*.key
+config/config.prod.json
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# Docker
+infra/docker/*.override.yml

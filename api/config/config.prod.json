@@ -1,0 +1,15 @@
+{
+  "listeners": [{ "address": "0.0.0.0", "port": 8080, "https": false }],
+  "db_clients": [
+    {
+      "name": "default",
+      "rdbms": "mysql",
+      "host": "${DRIVEX_DB_HOST}",
+      "port": 3306,
+      "dbname": "drivex",
+      "user": "${DRIVEX_DB_USER}",
+      "passwd": "${DRIVEX_DB_PASSWORD}"
+    }
+  ],
+  "app": { "threads_num": 16, "log": { "log_level": "INFO" } }
+}

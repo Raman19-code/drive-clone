@@ -1,0 +1,11 @@
+{
+  "name": "drivex-frontend",
+  "version": "0.1.0",
+  "scripts": {
+    "build:css": "tailwindcss -i ./static/css/input.css -o ./static/css/output.built.css --minify",
+    "watch:css": "tailwindcss -i ./static/css/input.css -o ./static/css/output.built.css --watch"
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.0"
+  }
+}

@@ -1,0 +1,9 @@
+<!-- Share dialog: grant/revoke per-user permissions, create expiring share links -->
+<div id="modal" class="modal">
+  <form hx-post="/share-links" hx-target="#share-link-result">
+    <input type="hidden" name="resource_id" value="{{ resource_id }}" />
+    <select name="permission_role"><option value="viewer">Viewer</option><option value="editor">Editor</option></select>
+    <button type="submit">Create link</button>
+  </form>
+  <div id="share-link-result"></div>
+</div>
