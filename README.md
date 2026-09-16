@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # DriveX
 
 Self-hosted, production-grade cloud file storage platform (Google Drive analogue) built to demonstrate full-stack systems engineering: relational data modeling, object storage at scale, asynchronous AI/ML pipelines, and horizontally-scalable backend architecture.
@@ -68,3 +69,7 @@ See `docs/architecture.md` for full phase breakdown and load-test targets.
 ## License
 
 MIT (or update as needed).
+=======
+# drive-clone
+Self-hosted, production-grade cloud storage platform (Drive analogue) with a C++ (Drogon) API, async Python/Celery AI pipeline for semantic search &amp; RAG chat, MySQL + MinIO + Qdrant, and staged load-testing — built to demonstrate scalable systems design
+>>>>>>> 07cf5323ddcae622457755ba0d92f6439c0bb2f6
