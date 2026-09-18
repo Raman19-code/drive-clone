@@ -1,68 +1,3219 @@
 openapi: 3.0.3
 info:
-  title: DriveX API
-  version: 0.1.0
+  title: DriveX Cloud Storage & AI Search REST API
+  version: 1.0.0
+  description: |
+    DriveX is an enterprise-grade, high-concurrency, self-hosted cloud storage platform
+    architected as a high-performance Google Drive analogue.
+    
+    The platform decouples the stateless Control Plane (implemented in C++ utilizing Drogon,
+    MySQL 8.0, and Redis 7.0) from the Data Plane (direct client-to-MinIO S3 streaming via
+    SHA-256 pre-signed PUT and GET URLs).
+    
+    Security is governed by asymmetric RS256 JSON Web Tokens (15-minute expiration), rotating
+    refresh tokens (30-day lifecycle), Argon2id memory-hard password hashing (m=64MB, t=3, p=4),
+    and recursive ancestor Role-Based Access Control (RBAC).
+    
+    All error conditions adhere strictly to RFC 7807 Problem Details (`application/problem+json`).
+  contact:
+    name: DriveX Systems Engineering Team
+    email: api-support@drivex.internal
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0.html
+
+servers:
+  - url: https://api.drivex.dev
+    description: Production Edge Ingress (Nginx TLS 1.3 Reverse Proxy)
+  - url: http://localhost:8080
+    description: Local Drogon C++ Core API Development Server
+
+tags:
+  - name: Authentication
+    description: User registration, Argon2id credential verification, RS256 token rotation, and session lifecycle.
+  - name: Folders
+    description: Hierarchical directory tree operations, cyclic move prevention, and breadcrumb path resolution.
+  - name: Files
+    description: S3 pre-signed URL upload negotiation, completion validation, download signing, and version history.
+  - name: Permissions
+    description: Granular multi-tier RBAC access grants (viewer, editor, owner) with folder inheritance.
+  - name: Share Links
+    description: Public and semi-public tokenized links with TTL expiration and Argon2id password protection.
+  - name: Trash
+    description: Soft-delete lifecycle management, 30-day retention policies, single-item restore, and purge.
+  - name: AI & Search
+    description: Hybrid reciprocal rank vector search and Server-Sent Events (SSE) RAG conversational streaming.
+
 paths:
-  /auth/register:
+  # ============================================================================
+  # 1. Authentication Endpoints
+  # ============================================================================
+  /api/v1/auth/register:
     post:
-      summary: Register a new user
+      tags:
+        - Authentication
+      summary: Register a new user account
+      description: |
+        Creates a new user account, initializes default storage quota (15 GB),
+        and safely hashes credentials using Argon2id (`m=64MB, t=3, p=4`).
+      operationId: registerUser
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
       responses:
-        "201":
-          description: Created
-  /auth/login:
+        '201':
+          description: User account created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '409':
+          description: Email address already registered.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ConflictProblem'
+        '422':
+          $ref: '#/components/responses/422UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/auth/login:
     post:
-      summary: Log in and receive a JWT
+      tags:
+        - Authentication
+      summary: Authenticate user credentials
+      description: |
+        Verifies cleartext password against the stored Argon2id hash. Upon verification,
+        issues an RS256 signed JWT access token (15-minute lifetime) and a cryptographically
+        secure 256-bit refresh token (30-day lifetime).
+      operationId: loginUser
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
       responses:
-        "200":
-          description: OK
-  /folders:
+        '200':
+          description: Authentication successful. Returns JWT access token and sets refresh cookie.
+          headers:
+            Set-Cookie:
+              description: Secure, HttpOnly, SameSite=Strict refresh token cookie (`drivex_refresh_token`).
+              schema:
+                type: string
+                example: drivex_refresh_token=9e2a8...; Path=/api/v1/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          description: Invalid email or password credentials.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedProblem'
+        '429':
+          $ref: '#/components/responses/429TooManyRequests'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/auth/refresh:
     post:
-      summary: Create a folder
+      tags:
+        - Authentication
+      summary: Refresh JWT access token
+      description: |
+        Rotates an existing refresh token and issues a new RS256 access token.
+        Detects token reuse: attempting to reuse an invalidated refresh token revokes all
+        tokens associated with the parent session.
+      operationId: refreshToken
+      security:
+        - RefreshTokenCookie: []
+        - RefreshTokenHeader: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
       responses:
-        "201":
-          description: Created
+        '200':
+          description: Access token refreshed successfully.
+          headers:
+            Set-Cookie:
+              description: Updated rotating refresh token cookie.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          description: Refresh token expired, revoked, or compromised.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedProblem'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/auth/logout:
+    post:
+      tags:
+        - Authentication
+      summary: Log out and terminate session
+      description: |
+        Invalidates the current session by revoking the refresh token in MySQL and
+        adding the active access token's `jti` to the Redis blacklist with a TTL matching
+        the remaining token lifespan.
+      operationId: logoutUser
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Successfully logged out.
+          headers:
+            Set-Cookie:
+              description: Clears refresh token cookie with Max-Age=0.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogoutResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/auth/me:
     get:
-      summary: List folder contents
+      tags:
+        - Authentication
+      summary: Get current authenticated user profile
+      description: |
+        Retrieves the authenticated user's profile information, assigned storage quota,
+        current storage utilization in bytes, and account status.
+      operationId: getCurrentUser
+      security:
+        - BearerAuth: []
       responses:
-        "200":
-          description: OK
-  /files/upload-url:
-    post:
-      summary: Request a pre-signed MinIO upload URL
-      responses:
-        "200":
-          description: OK
-  /files/upload-complete:
-    post:
-      summary: Confirm upload and write metadata
-      responses:
-        "200":
-          description: OK
-  /files/{id}/download-url:
+        '200':
+          description: Current user profile and storage allocation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfileResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  # ============================================================================
+  # 2. Folder Hierarchy & Navigation Endpoints
+  # ============================================================================
+  /api/v1/folders:
     get:
-      summary: Get a pre-signed download URL
+      tags:
+        - Folders
+      summary: List folders
+      description: |
+        Retrieves paginated folders in the user's root space or filtered by a specific parent folder.
+        Uses composite indexes `(owner_id, parent_id, is_trashed, name)` for rapid retrieval.
+      operationId: listFolders
+      security:
+        - BearerAuth: []
       parameters:
-        - in: path
-          name: id
-          required: true
-          schema: { type: integer }
+        - name: parent_id
+          in: query
+          required: false
+          description: Parent folder ID to list. If null or omitted, lists root-level folders.
+          schema:
+            type: integer
+            nullable: true
+            example: 42
+        - name: page
+          in: query
+          required: false
+          description: Page index (1-based).
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          description: Number of items per page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: sort_by
+          in: query
+          required: false
+          description: Sort field.
+          schema:
+            type: string
+            enum: [name, created_at, updated_at]
+            default: name
+        - name: sort_order
+          in: query
+          required: false
+          description: Sort direction.
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: asc
       responses:
-        "200":
-          description: OK
-  /search:
-    get:
-      summary: Semantic search (proxied to ML API)
-      parameters:
-        - in: query
-          name: q
-          required: true
-          schema: { type: string }
-      responses:
-        "200":
-          description: OK
-  /chat:
+        '200':
+          description: Paginated folder listing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FolderListingResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
     post:
-      summary: RAG "ask your drive" chat (proxied to ML API)
+      tags:
+        - Folders
+      summary: Create a new folder
+      description: |
+        Creates a new folder entity under the specified parent folder (or at root).
+        Enforces a maximum folder nesting depth of 32 levels.
+      operationId: createFolder
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateFolderRequest'
       responses:
-        "200":
-          description: OK
+        '201':
+          description: Folder created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Folder'
+        '400':
+          description: Validation error or max depth exceeded (depth > 32).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/BadRequestProblem'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          description: Target parent folder does not exist.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/NotFoundProblem'
+        '409':
+          description: A folder with the same name already exists in the target directory.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ConflictProblem'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/folders/{id}:
+    get:
+      tags:
+        - Folders
+      summary: Get folder details and effective permissions
+      description: |
+        Retrieves detailed folder metadata, path resolution, and the requesting user's
+        resolved effective role (`viewer`, `editor`, or `owner`).
+      operationId: getFolderById
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique folder identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 88
+      responses:
+        '200':
+          description: Folder metadata and effective permissions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FolderDetail'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+    patch:
+      tags:
+        - Folders
+      summary: Update folder metadata
+      description: |
+        Renames a folder. To relocate a folder to a new parent, use the dedicated
+        atomic move endpoint `/api/v1/folders/{id}/move` to guarantee cycle detection.
+      operationId: updateFolder
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique folder identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 88
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateFolderRequest'
+      responses:
+        '200':
+          description: Folder renamed successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Folder'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          description: Folder with target name already exists in current parent directory.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ConflictProblem'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+    delete:
+      tags:
+        - Folders
+      summary: Soft-delete folder or permanently purge
+      description: |
+        By default, soft-deletes a folder and all its descendant items to Trash (`is_trashed=true`).
+        If `permanent=true` query parameter is passed, recursively purges the folder,
+        removes database records, and schedules background blob deletion in MinIO.
+      operationId: deleteFolder
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique folder identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 88
+        - name: permanent
+          in: query
+          required: false
+          description: If true, permanently purges folder without moving to Trash.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '204':
+          $ref: '#/components/responses/204NoContent'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/folders/{id}/children:
+    get:
+      tags:
+        - Folders
+      summary: List immediate child folders and files
+      description: |
+        Retrieves all immediate non-trashed child subfolders and files contained inside
+        folder `{id}`. Returns file metadata including MIME types, byte sizes, and checksums.
+      operationId: getFolderChildren
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique folder identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 88
+        - name: page
+          in: query
+          required: false
+          description: Page index (1-based).
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          description: Number of items per page.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: Immediate child folders and files within the directory.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FolderChildrenResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/folders/{id}/breadcrumbs:
+    get:
+      tags:
+        - Folders
+      summary: Retrieve ancestor breadcrumb trail
+      description: |
+        Computes the complete breadcrumb hierarchy from root down to folder `{id}` using
+        an optimized MySQL 8 Recursive Common Table Expression (CTE).
+      operationId: getFolderBreadcrumbs
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique folder identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 88
+      responses:
+        '200':
+          description: Ordered list of breadcrumbs from root to current folder.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Breadcrumb'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/folders/{id}/move:
+    post:
+      tags:
+        - Folders
+      summary: Relocate folder with cycle detection and depth validation
+      description: |
+        Relocates folder `{id}` to a new parent directory. Employs Redis distributed locking
+        (`lock:folder:{id}`) and ancestor graph traversal to prevent circular hierarchies
+        (e.g., attempting to move folder A into one of its own subfolders).
+        Also verifies the move does not exceed the maximum folder tree depth limit of 32.
+      operationId: moveFolder
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique identifier of the folder to relocate.
+          schema:
+            type: integer
+            minimum: 1
+            example: 88
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MoveFolderRequest'
+      responses:
+        '200':
+          description: Folder relocated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Folder'
+        '400':
+          description: Cycle detected (target is a descendant) or max depth exceeded.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/BadRequestProblem'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          description: Conflicting folder name exists in destination directory.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ConflictProblem'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  # ============================================================================
+  # 3. File Operations & Pre-Signed URL Endpoints
+  # ============================================================================
+  /api/v1/files/upload-url:
+    post:
+      tags:
+        - Files
+      summary: Request pre-signed S3 PUT URL for direct-to-MinIO upload
+      description: |
+        Initiates a direct client-to-MinIO upload flow.
+        1. Validates requesting user has `editor` or `owner` role on target folder.
+        2. Atomically reserves storage quota in Redis (`used + size <= quota`).
+        3. Computes immutable S3 storage key: `blobs/{owner_id}/{yyyy-mm}/{uuid}-{filename}`.
+        4. Issues AWS SigV4 pre-signed PUT URL with `x-amz-checksum-sha256` header (15-minute expiration).
+        5. Caches upload session in Redis key `upload:pending:{upload_id}`.
+      operationId: getUploadUrl
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadUrlRequest'
+      responses:
+        '200':
+          description: Pre-signed S3 PUT URL generated. Client must PUT binary bytes directly to MinIO.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadUrlResponse'
+        '400':
+          description: Quota exceeded or invalid input parameters.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/BadRequestProblem'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          description: Specified folder_id does not exist.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/NotFoundProblem'
+        '413':
+          description: Upload payload exceeds system maximum single-file upload limit (5 GB).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/PayloadTooLargeProblem'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+        '503':
+          description: MinIO S3 cluster unreachable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ServiceUnavailableProblem'
+
+  /api/v1/files/upload-complete:
+    post:
+      tags:
+        - Files
+      summary: Confirm MinIO upload and commit database metadata
+      description: |
+        Called by client immediately after HTTP PUT to MinIO completes with 200 OK.
+        1. Drogon executes an internal non-blocking S3 `HeadObject` call to MinIO.
+        2. Validates object existence, byte size match, and ETag/checksum consistency.
+        3. Runs an atomic MySQL transaction: inserts/updates `files` and `file_versions`,
+           updates user `storage_used_bytes`, and records `audit_log`.
+        4. Invalidates parent folder cache in Redis.
+        5. Publishes asynchronous event `file.uploaded` to RabbitMQ exchange `drivex.events`.
+      operationId: confirmUpload
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UploadCompleteRequest'
+      responses:
+        '201':
+          description: Upload confirmed and committed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadCompleteResponse'
+        '400':
+          description: Object missing in MinIO, checksum mismatch, or invalid session.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/BadRequestProblem'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '409':
+          description: Concurrent finalization conflict or duplicate version.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ConflictProblem'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/files/{id}:
+    get:
+      tags:
+        - Files
+      summary: Get file metadata and version summary
+      description: |
+        Retrieves file metadata, size, MIME type, SHA-256 digest, current version ID,
+        and AI-generated tags.
+      operationId: getFileById
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique file identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 412
+      responses:
+        '200':
+          description: File metadata details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileDetail'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+    patch:
+      tags:
+        - Files
+      summary: Rename or relocate file
+      description: |
+        Modifies file attributes (rename file or move to a different folder).
+        Requires `editor` or `owner` permission on both source and destination folders.
+      operationId: updateFile
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique file identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 412
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateFileRequest'
+      responses:
+        '200':
+          description: File updated successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/File'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '409':
+          description: Conflicting file name exists in destination folder.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ConflictProblem'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+    delete:
+      tags:
+        - Files
+      summary: Soft-delete file or permanently purge
+      description: |
+        Moves file to Trash (`is_trashed=true`). If `permanent=true` is passed,
+        permanently deletes MySQL records, purges MinIO blobs, reconciles user storage quota,
+        and emits `file.deleted` to RabbitMQ for Qdrant vector cleanup.
+      operationId: deleteFile
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique file identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 412
+        - name: permanent
+          in: query
+          required: false
+          description: Permanently purge without moving to Trash.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '204':
+          $ref: '#/components/responses/204NoContent'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/files/{id}/restore:
+    post:
+      tags:
+        - Files
+      summary: Restore soft-deleted file
+      description: |
+        Restores a file from Trash back to active state. If the original parent folder
+        was permanently deleted, restores the file to the root directory.
+      operationId: restoreFile
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique file identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 412
+      responses:
+        '200':
+          description: File restored successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/File'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/files/{id}/download-url:
+    get:
+      tags:
+        - Files
+      summary: Request pre-signed S3 GET URL for direct file download
+      description: |
+        Generates an authenticated, short-lived AWS SigV4 pre-signed S3 GET URL (5-minute TTL).
+        The client downloads raw bytes directly from MinIO without placing network load on Drogon.
+        Supports query parameters to force download (`disposition=attachment`) or browser view (`disposition=inline`).
+      operationId: getDownloadUrl
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique file identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 412
+        - name: version_id
+          in: query
+          required: false
+          description: Optional version ID. Defaults to current version if omitted.
+          schema:
+            type: integer
+            minimum: 1
+        - name: disposition
+          in: query
+          required: false
+          description: Content-Disposition header behavior.
+          schema:
+            type: string
+            enum: [inline, attachment]
+            default: attachment
+      responses:
+        '200':
+          description: Pre-signed S3 GET URL generated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadUrlResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+        '503':
+          $ref: '#/components/responses/503ServiceUnavailable'
+
+  /api/v1/files/{id}/versions:
+    get:
+      tags:
+        - Files
+      summary: List revision history for a file
+      description: |
+        Returns an ordered list of all historical versions for file `{id}` including
+        version numbers, byte sizes, upload timestamps, creator IDs, and SHA-256 digests.
+      operationId: listFileVersions
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique file identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 412
+      responses:
+        '200':
+          description: Complete version history for the file.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FileVersionListResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/files/{id}/versions/{version_id}/download-url:
+    get:
+      tags:
+        - Files
+      summary: Get pre-signed download URL for a specific historical version
+      description: |
+        Generates an S3 pre-signed GET URL targeting an exact historical version of the file
+        referenced by `{version_id}`.
+      operationId: getVersionDownloadUrl
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique file identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 412
+        - name: version_id
+          in: path
+          required: true
+          description: Specific version record identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 2
+        - name: disposition
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [inline, attachment]
+            default: attachment
+      responses:
+        '200':
+          description: Pre-signed S3 GET URL targeting the specific version object.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadUrlResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          description: File or version not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/NotFoundProblem'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  # ============================================================================
+  # 4. RBAC Permissions Endpoints
+  # ============================================================================
+  /api/v1/permissions:
+    get:
+      tags:
+        - Permissions
+      summary: List direct permissions on a resource
+      description: |
+        Retrieves all explicitly granted user permissions for a specified file or folder.
+      operationId: listPermissions
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: resource_type
+          in: query
+          required: true
+          description: Type of resource to query permissions for.
+          schema:
+            type: string
+            enum: [file, folder]
+            example: folder
+        - name: resource_id
+          in: query
+          required: true
+          description: Unique ID of the target resource.
+          schema:
+            type: integer
+            minimum: 1
+            example: 88
+      responses:
+        '200':
+          description: Direct permission grants on the resource.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PermissionListResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+    post:
+      tags:
+        - Permissions
+      summary: Grant or modify user access to a resource
+      description: |
+        Grants access (`viewer`, `editor`, or `owner`) on a file or folder to a collaborator
+        identified by email. Permissions granted on a folder automatically cascade recursively
+        down the directory tree.
+      operationId: grantPermission
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePermissionRequest'
+      responses:
+        '201':
+          description: Permission granted successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Permission'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          description: Resource or user email not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/NotFoundProblem'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/permissions/{id}:
+    get:
+      tags:
+        - Permissions
+      summary: Get details of a specific permission grant
+      description: Retrieves details of an existing permission record by its primary key ID.
+      operationId: getPermissionById
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique permission identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 15
+      responses:
+        '200':
+          description: Permission record details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Permission'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+    patch:
+      tags:
+        - Permissions
+      summary: Update role on an existing permission grant
+      description: Updates the assigned role (`viewer`, `editor`, or `owner`) of an existing grant.
+      operationId: updatePermissionRole
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique permission identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 15
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdatePermissionRequest'
+      responses:
+        '200':
+          description: Permission role updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Permission'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+    delete:
+      tags:
+        - Permissions
+      summary: Revoke access permission
+      description: |
+        Removes an explicit access permission grant. Invalidates downstream Redis permission
+        caches (`perm:eff:*`) immediately.
+      operationId: revokePermission
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Unique permission identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 15
+      responses:
+        '204':
+          $ref: '#/components/responses/204NoContent'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  # ============================================================================
+  # 5. Share Links Endpoints
+  # ============================================================================
+  /api/v1/share-links:
+    get:
+      tags:
+        - Share Links
+      summary: List user's created share links
+      description: Lists all active and expired share links created by the authenticated user.
+      operationId: listShareLinks
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: List of created share links.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLinkListResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+    post:
+      tags:
+        - Share Links
+      summary: Create an expiring or password-protected public share link
+      description: |
+        Generates a tokenized public URL for a file or folder.
+        Supports optional Argon2id password protection, fixed expiration timestamp,
+        and maximum total download download count limits.
+      operationId: createShareLink
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateShareLinkRequest'
+      responses:
+        '201':
+          description: Share link created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLink'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/share-links/{token}:
+    get:
+      tags:
+        - Share Links
+      summary: Resolve share link metadata
+      description: |
+        Public endpoint to resolve a share link token. Returns resource metadata (name, size, MIME type)
+        and indicates whether an Argon2id password is required before access is granted.
+      operationId: resolveShareLink
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: 64-character public share token.
+          schema:
+            type: string
+            example: sh_7f29a0c8b3e411ef8f6e0242ac120002
+      responses:
+        '200':
+          description: Share link public summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLinkPublicResponse'
+        '404':
+          description: Share link not found or revoked.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/NotFoundProblem'
+        '410':
+          description: Share link expired or maximum download limit exceeded.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+    delete:
+      tags:
+        - Share Links
+      summary: Revoke share link
+      description: Deactivates an active share link immediately, invalidating external access.
+      operationId: revokeShareLink
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: 64-character public share token.
+          schema:
+            type: string
+            example: sh_7f29a0c8b3e411ef8f6e0242ac120002
+      responses:
+        '204':
+          $ref: '#/components/responses/204NoContent'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/share-links/{token}/verify-password:
+    post:
+      tags:
+        - Share Links
+      summary: Verify password for a protected share link
+      description: |
+        Verifies the supplied password against the share link's Argon2id password hash.
+        On success, issues a short-lived download token (5-minute TTL) passed via `X-Share-Token`
+        or query parameter to authorize binary file streaming.
+      operationId: verifyShareLinkPassword
+      security: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: Public share token.
+          schema:
+            type: string
+            example: sh_7f29a0c8b3e411ef8f6e0242ac120002
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifySharePasswordRequest'
+      responses:
+        '200':
+          description: Password verified. Returns scoped temporary download token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VerifySharePasswordResponse'
+        '401':
+          description: Incorrect passcode.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedProblem'
+        '410':
+          description: Link expired or download limit reached.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/share-links/{token}/download:
+    get:
+      tags:
+        - Share Links
+      summary: Download shared file
+      description: |
+        Public download endpoint for shared files. If password-protected, requires the scoped
+        `X-Share-Token` header or `download_token` query parameter obtained from password verification.
+        Generates and redirects (or returns) an S3 pre-signed GET URL and increments `download_count`.
+      operationId: downloadSharedFile
+      security:
+        - ShareTokenHeader: []
+      parameters:
+        - name: token
+          in: path
+          required: true
+          description: Public share token.
+          schema:
+            type: string
+            example: sh_7f29a0c8b3e411ef8f6e0242ac120002
+        - name: download_token
+          in: query
+          required: false
+          description: Scoped verification token (for password-protected links).
+          schema:
+            type: string
+            example: sc_99a8b12f...
+      responses:
+        '200':
+          description: Pre-signed download URL returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadUrlResponse'
+        '302':
+          description: Direct redirect to MinIO S3 signed URL.
+        '401':
+          description: Password required or invalid download token.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/UnauthorizedProblem'
+        '410':
+          description: Share link expired or download limit exceeded.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  # ============================================================================
+  # 6. Trash Management Endpoints
+  # ============================================================================
+  /api/v1/trash:
+    get:
+      tags:
+        - Trash
+      summary: List soft-deleted items in Trash
+      description: |
+        Retrieves all trashed folders and files belonging to the authenticated user.
+        Calculates days remaining until the 30-day automatic purge window expires.
+      operationId: listTrashItems
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: List of items currently held in Trash.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrashListResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/trash/{item_type}/{id}/restore:
+    post:
+      tags:
+        - Trash
+      summary: Restore individual item from Trash
+      description: |
+        Restores a specific file or folder from Trash back to active state.
+        If the item's original parent folder was purged, the item is restored to the root directory.
+      operationId: restoreTrashItem
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: item_type
+          in: path
+          required: true
+          description: Type of item to restore.
+          schema:
+            type: string
+            enum: [file, folder]
+            example: file
+        - name: id
+          in: path
+          required: true
+          description: Unique item identifier.
+          schema:
+            type: integer
+            minimum: 1
+            example: 412
+      responses:
+        '200':
+          description: Item restored successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RestoreTrashResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          description: Trashed item not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/NotFoundProblem'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/trash/{item_type}/{id}:
+    delete:
+      tags:
+        - Trash
+      summary: Permanently delete a single item from Trash
+      description: |
+        Permanently purges a trashed file or folder. Immediately removes MySQL records,
+        deletes underlying binary objects in MinIO, decrements user storage utilization,
+        and invalidates Qdrant embeddings.
+      operationId: purgeTrashItem
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: item_type
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [file, folder]
+            example: file
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+            example: 412
+      responses:
+        '204':
+          $ref: '#/components/responses/204NoContent'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '403':
+          $ref: '#/components/responses/403Forbidden'
+        '404':
+          $ref: '#/components/responses/404NotFound'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  /api/v1/trash/empty:
+    post:
+      tags:
+        - Trash
+      summary: Empty entire Trash
+      description: |
+        Permanently removes all trashed files and folders for the authenticated user.
+        Dispatches background jobs to delete physical MinIO S3 objects and vector points.
+      operationId: emptyTrash
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Trash emptied successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EmptyTrashResponse'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+
+  # ============================================================================
+  # 7. AI & Search Endpoints
+  # ============================================================================
+  /api/v1/search:
+    get:
+      tags:
+        - AI & Search
+      summary: Search drive using hybrid semantic vector and keyword search
+      description: |
+        Executes a multi-modal search query across all files accessible to the authenticated user.
+        Combines dense vector embeddings in Qdrant (using `BAAI/bge-large-en-v1.5`) with sparse
+        keyword matching in MySQL FULLTEXT index via Reciprocal Rank Fusion (RRF).
+        Results are re-ranked using `bge-reranker-large`.
+      operationId: searchFiles
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search query string (natural language or keywords).
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 500
+            example: quarterly financial results 2025
+        - name: type
+          in: query
+          required: false
+          description: Search modality. Defaults to hybrid.
+          schema:
+            type: string
+            enum: [hybrid, semantic, keyword]
+            default: hybrid
+        - name: folder_id
+          in: query
+          required: false
+          description: Optional folder ID to restrict search scope to a specific subtree.
+          schema:
+            type: integer
+            minimum: 1
+            example: 88
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of search results to return.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          description: Pagination offset.
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Ranked search results with relevance scores and highlighted snippets.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+        '503':
+          description: AI search service temporarily offline (falls back to keyword search).
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ServiceUnavailableProblem'
+
+  /api/v1/chat:
+    post:
+      tags:
+        - AI & Search
+      summary: Interactive RAG conversational assistant streaming via Server-Sent Events (SSE)
+      description: |
+        Initiates a conversational RAG session ("Chat with your Drive").
+        The endpoint establishes a persistent HTTP connection returning a Server-Sent Events (SSE)
+        stream (`Content-Type: text/event-stream`).
+        
+        Stream Event Lifecycle:
+        1. `event: sources` - JSON array of retrieved and cited document chunks with file IDs and page numbers.
+        2. `event: token` - Incremental text tokens generated by the LLM.
+        3. `event: done` - Generation completed with final token metrics.
+        4. `event: error` - Stream error payload formatted as RFC 7807 problem details.
+      operationId: chatWithDrive
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: Accept
+          in: header
+          required: true
+          description: Must be set to `text/event-stream`.
+          schema:
+            type: string
+            enum: [text/event-stream]
+            default: text/event-stream
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatRequest'
+      responses:
+        '200':
+          description: Server-Sent Events stream delivering real-time RAG response tokens.
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                example: text/event-stream; charset=utf-8
+            Cache-Control:
+              schema:
+                type: string
+                example: no-cache, no-transform
+            Connection:
+              schema:
+                type: string
+                example: keep-alive
+            X-Accel-Buffering:
+              description: Instructs Nginx reverse proxy to disable response buffering.
+              schema:
+                type: string
+                example: "no"
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: "Stream of SSE events (`event: sources`, `event: token`, `event: done`)."
+                example: |
+                  event: sources
+                  data: [{"file_id":412,"name":"presentation.key","page":3,"relevance":0.94}]
+
+                  event: token
+                  data: {"delta":"According to "}
+
+                  event: token
+                  data: {"delta":"slide 3 of the presentation, revenue grew 18%."}
+
+                  event: done
+                  data: {"finish_reason":"stop","total_tokens":42}
+        '400':
+          $ref: '#/components/responses/400BadRequest'
+        '401':
+          $ref: '#/components/responses/401Unauthorized'
+        '500':
+          $ref: '#/components/responses/500InternalError'
+        '503':
+          description: LLM or vector retrieval backend unreachable.
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ServiceUnavailableProblem'
+
+# ==============================================================================
+# Components (Schemas, Security Schemes, Responses)
+# ==============================================================================
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        RS256 asymmetric JSON Web Token. Validated locally in Drogon C++ memory using the
+        embedded RSA public key. Lifespan is 15 minutes (900 seconds).
+    RefreshTokenCookie:
+      type: apiKey
+      in: cookie
+      name: drivex_refresh_token
+      description: |
+        Cryptographically secure 256-bit token stored in an HttpOnly, Secure, SameSite=Strict cookie.
+        Rotates on every refresh request. Lifespan is 30 days.
+    RefreshTokenHeader:
+      type: apiKey
+      in: header
+      name: X-Refresh-Token
+      description: Alternative refresh token header for CLI and mobile applications.
+    ShareTokenHeader:
+      type: apiKey
+      in: header
+      name: X-Share-Token
+      description: Scoped verification token returned after authenticating against password-protected share links.
+
+  responses:
+    '204NoContent':
+      description: Operation succeeded with no content returned.
+    '400BadRequest':
+      description: Invalid request syntax, parameters, or business rule violation.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/BadRequestProblem'
+    '401Unauthorized':
+      description: Missing, invalid, or expired authentication credentials.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/UnauthorizedProblem'
+    '403Forbidden':
+      description: Authenticated user lacks necessary permissions on the target resource.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ForbiddenProblem'
+    '404NotFound':
+      description: Target resource does not exist or user lacks visibility.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/NotFoundProblem'
+    '409Conflict':
+      description: Resource conflict (e.g., naming collision or concurrent modification).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ConflictProblem'
+    '410Gone':
+      description: Resource was permanently deleted or share link has expired.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/GoneProblem'
+    '413PayloadTooLarge':
+      description: Upload size exceeds remaining quota or system single-file limit.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/PayloadTooLargeProblem'
+    '422UnprocessableEntity':
+      description: Request body is syntactically valid JSON but violates schema validation rules.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/UnprocessableEntityProblem'
+    '429TooManyRequests':
+      description: Rate limit exceeded (IP or user-level token bucket exhausted).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/TooManyRequestsProblem'
+    '500InternalError':
+      description: Unexpected internal server error.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/InternalServerErrorProblem'
+    '503ServiceUnavailable':
+      description: Downstream dependency (MinIO, MySQL, Qdrant, RabbitMQ) unavailable.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ServiceUnavailableProblem'
+
+  schemas:
+    # --------------------------------------------------------------------------
+    # RFC 7807 Problem Details Schemas
+    # --------------------------------------------------------------------------
+    ProblemDetails:
+      type: object
+      required:
+        - type
+        - title
+        - status
+        - detail
+        - instance
+        - code
+        - timestamp
+      properties:
+        type:
+          type: string
+          format: uri
+          description: An absolute URI identifying the problem type.
+          example: https://api.drivex.dev/errors/resource-not-found
+        title:
+          type: string
+          description: Short, human-readable summary of the problem type.
+          example: Resource Not Found
+        status:
+          type: integer
+          description: The HTTP status code generated by the origin server.
+          example: 404
+        detail:
+          type: string
+          description: Detailed human-readable explanation specific to this occurrence of the problem.
+          example: The folder with ID 992 does not exist or has been permanently deleted.
+        instance:
+          type: string
+          format: uri-reference
+          description: A URI reference identifying the specific occurrence of the problem.
+          example: /api/v1/folders/992
+        code:
+          type: string
+          description: Machine-readable application error code string.
+          example: FOLDER_NOT_FOUND
+        timestamp:
+          type: string
+          format: date-time
+          description: UTC timestamp when the error occurred.
+          example: '2026-09-17T15:00:00Z'
+        invalid_params:
+          type: array
+          description: List of invalid request parameters for validation failures.
+          items:
+            type: object
+            required:
+              - name
+              - reason
+            properties:
+              name:
+                type: string
+                example: email
+              reason:
+                type: string
+                example: Must be a well-formed email address.
+              value:
+                type: string
+                example: not-an-email
+
+    BadRequestProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [400]
+              example: 400
+            code:
+              type: string
+              enum:
+                - INVALID_INPUT
+                - STORAGE_QUOTA_EXCEEDED
+                - CYCLIC_FOLDER_HIERARCHY
+                - MAX_DEPTH_EXCEEDED
+                - CHECKSUM_MISMATCH
+                - STORAGE_OBJECT_MISSING
+              example: STORAGE_QUOTA_EXCEEDED
+
+    UnauthorizedProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [401]
+              example: 401
+            code:
+              type: string
+              enum:
+                - INVALID_CREDENTIALS
+                - TOKEN_EXPIRED
+                - TOKEN_REVOKED
+                - REFRESH_TOKEN_REUSED
+                - INVALID_SIGNATURE
+                - PASSWORD_REQUIRED
+              example: INVALID_CREDENTIALS
+
+    ForbiddenProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [403]
+              example: 403
+            code:
+              type: string
+              enum:
+                - INSUFFICIENT_PERMISSIONS
+                - RESOURCE_LOCKED
+              example: INSUFFICIENT_PERMISSIONS
+
+    NotFoundProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [404]
+              example: 404
+            code:
+              type: string
+              enum:
+                - USER_NOT_FOUND
+                - FOLDER_NOT_FOUND
+                - FILE_NOT_FOUND
+                - VERSION_NOT_FOUND
+                - SHARE_LINK_NOT_FOUND
+              example: FILE_NOT_FOUND
+
+    ConflictProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [409]
+              example: 409
+            code:
+              type: string
+              enum:
+                - RESOURCE_ALREADY_EXISTS
+                - CONCURRENT_MODIFICATION
+                - EMAIL_ALREADY_REGISTERED
+              example: RESOURCE_ALREADY_EXISTS
+
+    GoneProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [410]
+              example: 410
+            code:
+              type: string
+              enum:
+                - SHARE_LINK_EXPIRED
+                - UPLOAD_SESSION_EXPIRED
+              example: SHARE_LINK_EXPIRED
+
+    PayloadTooLargeProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [413]
+              example: 413
+            code:
+              type: string
+              enum:
+                - FILE_SIZE_EXCEEDED
+                - STORAGE_LIMIT_EXCEEDED
+              example: FILE_SIZE_EXCEEDED
+
+    UnprocessableEntityProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [422]
+              example: 422
+            code:
+              type: string
+              enum:
+                - VALIDATION_FAILED
+                - UNSUPPORTED_MEDIA_TYPE
+              example: VALIDATION_FAILED
+
+    TooManyRequestsProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [429]
+              example: 429
+            code:
+              type: string
+              enum:
+                - RATE_LIMIT_EXCEEDED
+              example: RATE_LIMIT_EXCEEDED
+            retry_after_seconds:
+              type: integer
+              example: 60
+
+    InternalServerErrorProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [500]
+              example: 500
+            code:
+              type: string
+              enum:
+                - INTERNAL_SERVER_ERROR
+              example: INTERNAL_SERVER_ERROR
+
+    ServiceUnavailableProblem:
+      allOf:
+        - $ref: '#/components/schemas/ProblemDetails'
+        - type: object
+          properties:
+            status:
+              type: integer
+              enum: [503]
+              example: 503
+            code:
+              type: string
+              enum:
+                - STORAGE_UNAVAILABLE
+                - DATABASE_READONLY
+                - AI_ASSISTANT_UNAVAILABLE
+                - BROKER_UNAVAILABLE
+              example: STORAGE_UNAVAILABLE
+
+    # --------------------------------------------------------------------------
+    # Authentication & User Schemas
+    # --------------------------------------------------------------------------
+    RegisterRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 255
+          example: jane.doe@example.com
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 128
+          description: Password string hashed via Argon2id.
+          example: SecureP@ssw0rd2026!
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          example: jane.doe@example.com
+        password:
+          type: string
+          format: password
+          example: SecureP@ssw0rd2026!
+
+    RefreshRequest:
+      type: object
+      properties:
+        refresh_token:
+          type: string
+          description: Hexadecimal 256-bit refresh token (optional if provided via cookie).
+          example: a4f89d3c7b2e10f823a49...
+
+    User:
+      type: object
+      required:
+        - id
+        - email
+        - storage_quota_bytes
+        - storage_used_bytes
+        - status
+        - created_at
+      properties:
+        id:
+          type: integer
+          example: 105
+        email:
+          type: string
+          format: email
+          example: jane.doe@example.com
+        storage_quota_bytes:
+          type: integer
+          format: int64
+          description: Maximum allowed storage limit in bytes (e.g. 15 GB).
+          example: 16106127360
+        storage_used_bytes:
+          type: integer
+          format: int64
+          description: Currently consumed storage in bytes.
+          example: 2147483648
+        status:
+          type: string
+          enum: [active, suspended, deleted]
+          example: active
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-09-17T14:50:00Z'
+
+    AuthResponse:
+      type: object
+      required:
+        - token_type
+        - access_token
+        - expires_in
+        - user
+      properties:
+        token_type:
+          type: string
+          enum: [Bearer]
+          example: Bearer
+        access_token:
+          type: string
+          description: RS256 signed JSON Web Token.
+          example: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+        expires_in:
+          type: integer
+          description: Access token lifetime in seconds (900s = 15m).
+          example: 900
+        refresh_token:
+          type: string
+          description: Refresh token (also set via HttpOnly cookie).
+          example: a4f89d3c7b2e10f823a49...
+        refresh_expires_in:
+          type: integer
+          description: Refresh token lifetime in seconds (2592000s = 30d).
+          example: 2592000
+        user:
+          $ref: '#/components/schemas/User'
+
+    TokenResponse:
+      type: object
+      required:
+        - token_type
+        - access_token
+        - expires_in
+      properties:
+        token_type:
+          type: string
+          enum: [Bearer]
+          example: Bearer
+        access_token:
+          type: string
+          example: eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...
+        expires_in:
+          type: integer
+          example: 900
+        refresh_token:
+          type: string
+          example: e8291bf02a4...
+
+    UserProfileResponse:
+      type: object
+      required:
+        - id
+        - email
+        - storage_quota_bytes
+        - storage_used_bytes
+        - percent_used
+        - status
+        - created_at
+      properties:
+        id:
+          type: integer
+          example: 105
+        email:
+          type: string
+          format: email
+          example: jane.doe@example.com
+        storage_quota_bytes:
+          type: integer
+          format: int64
+          example: 16106127360
+        storage_used_bytes:
+          type: integer
+          format: int64
+          example: 2147483648
+        percent_used:
+          type: number
+          format: float
+          description: Percentage of quota used.
+          example: 13.33
+        status:
+          type: string
+          enum: [active, suspended, deleted]
+          example: active
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-09-17T14:50:00Z'
+
+    LogoutResponse:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          example: Successfully logged out
+
+    # --------------------------------------------------------------------------
+    # Folder Schemas
+    # --------------------------------------------------------------------------
+    CreateFolderRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Name of the folder.
+          example: Quarterly Reports
+        parent_id:
+          type: integer
+          nullable: true
+          description: ID of the parent folder. Omit or pass null for root directory.
+          example: 42
+
+    UpdateFolderRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 255
+          example: Annual Reports
+
+    MoveFolderRequest:
+      type: object
+      required:
+        - new_parent_id
+      properties:
+        new_parent_id:
+          type: integer
+          nullable: true
+          description: Destination parent folder ID. Null moves to root.
+          example: 15
+
+    Breadcrumb:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: integer
+          nullable: true
+          description: Folder ID, or null for root drive.
+          example: 42
+        name:
+          type: string
+          example: Projects
+
+    Folder:
+      type: object
+      required:
+        - id
+        - name
+        - parent_id
+        - owner_id
+        - is_trashed
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: integer
+          example: 88
+        name:
+          type: string
+          example: Quarterly Reports
+        parent_id:
+          type: integer
+          nullable: true
+          example: 42
+        owner_id:
+          type: integer
+          example: 105
+        is_trashed:
+          type: boolean
+          example: false
+        trashed_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-09-17T14:55:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-09-17T14:55:00Z'
+
+    FolderDetail:
+      allOf:
+        - $ref: '#/components/schemas/Folder'
+        - type: object
+          required:
+            - breadcrumbs
+            - effective_role
+          properties:
+            breadcrumbs:
+              type: array
+              items:
+                $ref: '#/components/schemas/Breadcrumb'
+            effective_role:
+              type: string
+              enum: [viewer, editor, owner]
+              example: owner
+
+    FolderListingResponse:
+      type: object
+      required:
+        - items
+        - pagination
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Folder'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    FolderChildrenResponse:
+      type: object
+      required:
+        - folder_id
+        - folders
+        - files
+        - pagination
+      properties:
+        folder_id:
+          type: integer
+          nullable: true
+          example: 88
+        folders:
+          type: array
+          items:
+            $ref: '#/components/schemas/Folder'
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/File'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    # --------------------------------------------------------------------------
+    # File Schemas
+    # --------------------------------------------------------------------------
+    UploadUrlRequest:
+      type: object
+      required:
+        - name
+        - size_bytes
+        - mime_type
+        - checksum_sha256
+      properties:
+        folder_id:
+          type: integer
+          nullable: true
+          description: Destination folder ID (null for root).
+          example: 88
+        name:
+          type: string
+          maxLength: 255
+          example: quarterly_presentation.key
+        size_bytes:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 5368709120
+          description: Exact file size in bytes (max 5 GB).
+          example: 26214400
+        mime_type:
+          type: string
+          maxLength: 127
+          example: application/vnd.apple.keynote
+        checksum_sha256:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+          description: Hex-encoded SHA-256 digest of the payload.
+          example: 4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a
+
+    UploadUrlResponse:
+      type: object
+      required:
+        - upload_id
+        - upload_url
+        - storage_key
+        - expires_at
+      properties:
+        upload_id:
+          type: string
+          description: Opaque upload session identifier.
+          example: upl_8a92f038-5183-4a6c-941e-8219df0e318d
+        upload_url:
+          type: string
+          format: uri
+          description: AWS SigV4 signed S3 PUT URL for direct MinIO upload.
+          example: https://s3.drivex.dev/drivex-blobs/blobs/105/2026-09/upl_8a92f038.key?X-Amz-Algorithm=AWS4-HMAC-SHA256&...
+        storage_key:
+          type: string
+          description: Target object key in MinIO.
+          example: blobs/105/2026-09/upl_8a92f038.key
+        expires_at:
+          type: string
+          format: date-time
+          description: Timestamp when the pre-signed URL expires (15m).
+          example: '2026-09-17T15:15:00Z'
+
+    UploadCompleteRequest:
+      type: object
+      required:
+        - upload_id
+        - etag
+      properties:
+        upload_id:
+          type: string
+          example: upl_8a92f038-5183-4a6c-941e-8219df0e318d
+        etag:
+          type: string
+          description: S3 ETag returned by MinIO in the PUT response header.
+          example: '"5d41402abc4b2a76b9719d911017c592"'
+
+    UploadCompleteResponse:
+      type: object
+      required:
+        - file
+      properties:
+        file:
+          $ref: '#/components/schemas/File'
+
+    DownloadUrlResponse:
+      type: object
+      required:
+        - download_url
+        - expires_at
+        - filename
+        - size_bytes
+        - mime_type
+      properties:
+        download_url:
+          type: string
+          format: uri
+          description: Pre-signed AWS SigV4 GET URL for direct MinIO retrieval.
+          example: https://s3.drivex.dev/drivex-blobs/blobs/105/2026-09/upl_8a92f038.key?X-Amz-Algorithm=...
+        expires_at:
+          type: string
+          format: date-time
+          description: Timestamp when the download URL expires (5m).
+          example: '2026-09-17T15:10:00Z'
+        filename:
+          type: string
+          example: quarterly_presentation.key
+        size_bytes:
+          type: integer
+          format: int64
+          example: 26214400
+        mime_type:
+          type: string
+          example: application/vnd.apple.keynote
+
+    File:
+      type: object
+      required:
+        - id
+        - name
+        - folder_id
+        - owner_id
+        - mime_type
+        - size_bytes
+        - storage_key
+        - checksum_sha256
+        - current_version_id
+        - is_trashed
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: integer
+          example: 412
+        name:
+          type: string
+          example: quarterly_presentation.key
+        folder_id:
+          type: integer
+          nullable: true
+          example: 88
+        owner_id:
+          type: integer
+          example: 105
+        mime_type:
+          type: string
+          example: application/vnd.apple.keynote
+        size_bytes:
+          type: integer
+          format: int64
+          example: 26214400
+        storage_key:
+          type: string
+          example: blobs/105/2026-09/upl_8a92f038.key
+        checksum_sha256:
+          type: string
+          example: 4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a
+        current_version_id:
+          type: integer
+          example: 1
+        is_trashed:
+          type: boolean
+          example: false
+        trashed_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: null
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-09-17T15:05:00Z'
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-09-17T15:05:00Z'
+
+    FileDetail:
+      allOf:
+        - $ref: '#/components/schemas/File'
+        - type: object
+          required:
+            - tags
+            - effective_role
+          properties:
+            tags:
+              type: array
+              items:
+                type: string
+              example: [finance, presentation, keynote]
+            effective_role:
+              type: string
+              enum: [viewer, editor, owner]
+              example: owner
+
+    UpdateFileRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 255
+          example: quarterly_presentation_v2.key
+        folder_id:
+          type: integer
+          nullable: true
+          description: Destination folder ID to move the file into.
+          example: 92
+
+    FileVersion:
+      type: object
+      required:
+        - id
+        - file_id
+        - version_number
+        - storage_key
+        - size_bytes
+        - checksum_sha256
+        - created_by
+        - created_at
+      properties:
+        id:
+          type: integer
+          example: 1
+        file_id:
+          type: integer
+          example: 412
+        version_number:
+          type: integer
+          example: 1
+        storage_key:
+          type: string
+          example: blobs/105/2026-09/upl_8a92f038.key
+        size_bytes:
+          type: integer
+          format: int64
+          example: 26214400
+        checksum_sha256:
+          type: string
+          example: 4b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8a
+        created_by:
+          type: integer
+          example: 105
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-09-17T15:05:00Z'
+
+    FileVersionListResponse:
+      type: object
+      required:
+        - file_id
+        - versions
+      properties:
+        file_id:
+          type: integer
+          example: 412
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/FileVersion'
+
+    # --------------------------------------------------------------------------
+    # Permissions & RBAC Schemas
+    # --------------------------------------------------------------------------
+    Permission:
+      type: object
+      required:
+        - id
+        - resource_type
+        - resource_id
+        - user_id
+        - user_email
+        - role
+        - granted_at
+      properties:
+        id:
+          type: integer
+          example: 12
+        resource_type:
+          type: string
+          enum: [file, folder]
+          example: folder
+        resource_id:
+          type: integer
+          example: 88
+        user_id:
+          type: integer
+          example: 108
+        user_email:
+          type: string
+          format: email
+          example: collaborator@example.com
+        role:
+          type: string
+          enum: [viewer, editor, owner]
+          example: editor
+        granted_at:
+          type: string
+          format: date-time
+          example: '2026-09-17T15:00:00Z'
+
+    CreatePermissionRequest:
+      type: object
+      required:
+        - resource_type
+        - resource_id
+        - user_email
+        - role
+      properties:
+        resource_type:
+          type: string
+          enum: [file, folder]
+          example: folder
+        resource_id:
+          type: integer
+          example: 88
+        user_email:
+          type: string
+          format: email
+          example: collaborator@example.com
+        role:
+          type: string
+          enum: [viewer, editor, owner]
+          example: editor
+
+    UpdatePermissionRequest:
+      type: object
+      required:
+        - role
+      properties:
+        role:
+          type: string
+          enum: [viewer, editor, owner]
+          example: viewer
+
+    PermissionListResponse:
+      type: object
+      required:
+        - resource_type
+        - resource_id
+        - permissions
+      properties:
+        resource_type:
+          type: string
+          enum: [file, folder]
+          example: folder
+        resource_id:
+          type: integer
+          example: 88
+        permissions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Permission'
+
+    # --------------------------------------------------------------------------
+    # Share Links Schemas
+    # --------------------------------------------------------------------------
+    CreateShareLinkRequest:
+      type: object
+      required:
+        - resource_type
+        - resource_id
+      properties:
+        resource_type:
+          type: string
+          enum: [file, folder]
+          example: file
+        resource_id:
+          type: integer
+          example: 412
+        permission_role:
+          type: string
+          enum: [viewer, editor]
+          default: viewer
+          example: viewer
+        password:
+          type: string
+          description: Optional cleartext password to protect the link (hashed with Argon2id).
+          example: ClientConfidential2026!
+        expires_at:
+          type: string
+          format: date-time
+          description: Optional expiration timestamp.
+          example: '2026-09-24T15:00:00Z'
+        max_downloads:
+          type: integer
+          minimum: 1
+          nullable: true
+          description: Optional cap on the number of successful downloads.
+          example: 10
+
+    ShareLink:
+      type: object
+      required:
+        - id
+        - token
+        - share_url
+        - resource_type
+        - resource_id
+        - permission_role
+        - password_protected
+        - download_count
+        - created_at
+      properties:
+        id:
+          type: integer
+          example: 5
+        token:
+          type: string
+          example: sh_7f29a0c8b3e411ef8f6e0242ac120002
+        share_url:
+          type: string
+          format: uri
+          example: https://drivex.dev/share/sh_7f29a0c8b3e411ef8f6e0242ac120002
+        resource_type:
+          type: string
+          enum: [file, folder]
+          example: file
+        resource_id:
+          type: integer
+          example: 412
+        permission_role:
+          type: string
+          enum: [viewer, editor]
+          example: viewer
+        password_protected:
+          type: boolean
+          example: true
+        max_downloads:
+          type: integer
+          nullable: true
+          example: 10
+        download_count:
+          type: integer
+          example: 2
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-09-24T15:00:00Z'
+        created_at:
+          type: string
+          format: date-time
+          example: '2026-09-17T15:00:00Z'
+
+    ShareLinkPublicResponse:
+      type: object
+      required:
+        - token
+        - resource_type
+        - resource_name
+        - size_bytes
+        - permission_role
+        - password_required
+      properties:
+        token:
+          type: string
+          example: sh_7f29a0c8b3e411ef8f6e0242ac120002
+        resource_type:
+          type: string
+          enum: [file, folder]
+          example: file
+        resource_name:
+          type: string
+          example: quarterly_presentation.key
+        size_bytes:
+          type: integer
+          format: int64
+          example: 26214400
+        permission_role:
+          type: string
+          enum: [viewer, editor]
+          example: viewer
+        password_required:
+          type: boolean
+          example: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-09-24T15:00:00Z'
+
+    ShareLinkListResponse:
+      type: object
+      required:
+        - items
+        - pagination
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ShareLink'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    VerifySharePasswordRequest:
+      type: object
+      required:
+        - password
+      properties:
+        password:
+          type: string
+          example: ClientConfidential2026!
+
+    VerifySharePasswordResponse:
+      type: object
+      required:
+        - download_token
+        - expires_in
+      properties:
+        download_token:
+          type: string
+          description: Scoped verification token to authorize download.
+          example: sc_99a8b12f710a48...
+        expires_in:
+          type: integer
+          description: Download token validity in seconds (300s).
+          example: 300
+
+    # --------------------------------------------------------------------------
+    # Trash Schemas
+    # --------------------------------------------------------------------------
+    TrashItem:
+      type: object
+      required:
+        - id
+        - item_type
+        - name
+        - original_parent_id
+        - size_bytes
+        - trashed_at
+        - days_until_purge
+      properties:
+        id:
+          type: integer
+          example: 412
+        item_type:
+          type: string
+          enum: [file, folder]
+          example: file
+        name:
+          type: string
+          example: obsolete_draft.pdf
+        original_parent_id:
+          type: integer
+          nullable: true
+          example: 88
+        size_bytes:
+          type: integer
+          format: int64
+          example: 1048576
+        trashed_at:
+          type: string
+          format: date-time
+          example: '2026-09-10T12:00:00Z'
+        days_until_purge:
+          type: integer
+          description: Number of days remaining before 30-day retention window expires.
+          example: 23
+
+    TrashListResponse:
+      type: object
+      required:
+        - items
+        - pagination
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TrashItem'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    RestoreTrashResponse:
+      type: object
+      required:
+        - item_type
+        - id
+        - name
+        - restored_to_folder_id
+      properties:
+        item_type:
+          type: string
+          enum: [file, folder]
+          example: file
+        id:
+          type: integer
+          example: 412
+        name:
+          type: string
+          example: obsolete_draft.pdf
+        restored_to_folder_id:
+          type: integer
+          nullable: true
+          example: 88
+
+    EmptyTrashResponse:
+      type: object
+      required:
+        - files_purged
+        - folders_purged
+        - bytes_reclaimed
+      properties:
+        files_purged:
+          type: integer
+          example: 14
+        folders_purged:
+          type: integer
+          example: 3
+        bytes_reclaimed:
+          type: integer
+          format: int64
+          example: 157286400
+
+    # --------------------------------------------------------------------------
+    # AI Search & RAG Schemas
+    # --------------------------------------------------------------------------
+    SearchHit:
+      type: object
+      required:
+        - file_id
+        - name
+        - mime_type
+        - size_bytes
+        - score
+        - path
+      properties:
+        file_id:
+          type: integer
+          example: 304
+        name:
+          type: string
+          example: Q3_Report_Final.pdf
+        mime_type:
+          type: string
+          example: application/pdf
+        size_bytes:
+          type: integer
+          format: int64
+          example: 1048576
+        score:
+          type: number
+          format: float
+          description: Combined Reciprocal Rank Fusion relevance score (0.0 to 1.0).
+          example: 0.924
+        snippet:
+          type: string
+          nullable: true
+          description: Relevant text excerpt with matching keyword highlights.
+          example: '...consolidated revenue for Q3 grew 18% year-over-year to $4.2M...'
+        path:
+          type: string
+          description: Hierarchical folder path string.
+          example: /Finance/Reports/2025
+
+    SearchResponse:
+      type: object
+      required:
+        - query
+        - search_type
+        - total_hits
+        - results
+      properties:
+        query:
+          type: string
+          example: quarterly financial results 2025
+        search_type:
+          type: string
+          enum: [hybrid, semantic, keyword]
+          example: hybrid
+        total_hits:
+          type: integer
+          example: 1
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchHit'
+
+    ChatMessage:
+      type: object
+      required:
+        - role
+        - content
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant]
+          example: user
+        content:
+          type: string
+          example: What were the total marketing expenses reported in the Q3 summary?
+
+    ChatRequest:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: The user query to execute against the Drive vector knowledge base.
+          example: What were the total marketing expenses reported in the Q3 summary?
+        folder_id:
+          type: integer
+          nullable: true
+          description: Optional folder ID to restrict RAG retrieval context.
+          example: 88
+        history:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+          description: Prior conversational turns to maintain multi-turn chat context.
+
+    ChatSource:
+      type: object
+      required:
+        - file_id
+        - name
+        - page
+        - relevance
+      properties:
+        file_id:
+          type: integer
+          example: 304
+        name:
+          type: string
+          example: Q3_Report_Final.pdf
+        page:
+          type: integer
+          example: 4
+        relevance:
+          type: number
+          format: float
+          example: 0.94
+
+    # --------------------------------------------------------------------------
+    # General Pagination Schema
+    # --------------------------------------------------------------------------
+    Pagination:
+      type: object
+      required:
+        - page
+        - limit
+        - total_items
+        - total_pages
+      properties:
+        page:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 50
+        total_items:
+          type: integer
+          example: 1
+        total_pages:
+          type: integer
+          example: 1

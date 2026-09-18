@@ -23,11 +23,16 @@ frontend/static/css/*.built.css
 *.key
 config/config.prod.json
 
+
 # OS / IDE
 .DS_Store
 .idea/
 .vscode/
 *.log
+
+# Agents
+.agents/
+ORIGINAL_REQUEST.md
 
 # Docker
 infra/docker/*.override.yml
